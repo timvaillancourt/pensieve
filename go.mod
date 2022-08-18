@@ -1,4 +1,4 @@
-module binlogfill
+module pensieve
 
 go 1.19
 

@@ -5,6 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"sort"
 
 	gomysql "github.com/go-mysql-org/go-mysql/mysql"
 	_ "github.com/go-sql-driver/mysql"
@@ -13,21 +16,51 @@ import (
 
 type Binlog struct {
 	LogName  string
+	LogPath  string
 	FileSize int64
 }
 
-type LogBinConfig struct {
-	Basename string
-	Index    string
+type ServerConfig struct {
+	GtidMode       string
+	LogBin         bool
+	LogBinBasename string
+	LogBinIndex    string
 }
 
 type BinlogFill struct {
-	db           *sql.DB
-	gtidExecuted *gomysql.UUIDSet
-	logBinCfg    LogBinConfig
+	db               *sql.DB
+	origGtidExecuted *gomysql.UUIDSet
+	serverCfg        ServerConfig
 }
 
-func (bf *BinlogFill) readBinaryLogs() (binlogs []Binlog, err error) {
+func (bf *BinlogFill) binlogIndexEntry(binlog Binlog) string {
+	dir := filepath.Dir(bf.serverCfg.LogBinBasename)
+	if filepath.Dir(bf.serverCfg.LogBinBasename) == filepath.Dir(bf.serverCfg.LogBinIndex) {
+		dir = "."
+	}
+	return fmt.Sprintf("%s/%s", dir, binlog.LogName)
+}
+
+func (bf *BinlogFill) writeBinlogIndex(binlogs []Binlog) error {
+	sort.Slice(binlogs, func(i, j int) bool {
+		return binlogs[i].LogName < binlogs[j].LogName
+	})
+
+	f, err := os.Open(bf.serverCfg.LogBinIndex)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, binlog := range binlogs {
+		if _, err = fmt.Fprintln(f, bf.binlogIndexEntry(binlog)); err != nil {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (bf *BinlogFill) getBinaryLogs() (binlogs []Binlog, err error) {
 	query := `SHOW BINARY LOGS`
 	rows, err := bf.db.Query(query)
 	if err != nil {
@@ -36,8 +69,8 @@ func (bf *BinlogFill) readBinaryLogs() (binlogs []Binlog, err error) {
 	}
 	defer rows.Close()
 
+	var binlog Binlog
 	for rows.Next() {
-		var binlog Binlog
 		if err = rows.Scan(&binlog.LogName, &binlog.FileSize); err != nil {
 			return nil, err
 		}
@@ -46,35 +79,66 @@ func (bf *BinlogFill) readBinaryLogs() (binlogs []Binlog, err error) {
 	return binlogs, err
 }
 
-func (bf *BinlogFill) readGtidExecuted() error {
-	var srcUUID string
-	var interval gomysql.Interval
-	query := `SELECT source_uuid, interval_start, interval_end FROM mysql.gtid_executed`
+type MasterStatus struct {
+	ExecGtidSet *gomysql.UUIDSet
+}
+
+func (bf *BinlogFill) getMasterStatus() (MasterStatus, error) {
+	query := `SHOW MASTER STATUS`
 	if err := bf.db.QueryRow(query).Scan(&srcUUID, &interval.Start, &interval.Stop); err != nil {
 		log.Fatalf("Failed to run %q query: %+v", query, err)
-		return err
+		return nil, err
 	}
 
 	sid, err := uuid.Parse(srcUUID)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
-	bf.gtidExecuted = &gomysql.UUIDSet{
+	return &gomysql.UUIDSet{
 		SID:       sid,
 		Intervals: gomysql.IntervalSlice{interval},
-	}
-	return err
+	}, nil
 }
 
-func (bf *BinlogFill) readLogBinConfig() error {
-	var logBinCfg LogBinConfig
-	query := `select @@global.log_bin_basename, @@global.log_bin_index`
-	if err := bf.db.QueryRow(query).Scan(&logBinCfg.Basename, &logBinCfg.Index); err != nil {
+func (bf *BinlogFill) readServerConfig() (serverCfg ServerConfig, err error) {
+	query := `select @@global.log_bin, @@global.log_bin_basename, @@global.log_bin_index, @@global.gtid_mode`
+	if err := bf.db.QueryRow(query).Scan(
+		&serverCfg.LogBin,
+		&serverCfg.LogBinBasename,
+		&serverCfg.LogBinIndex,
+		&serverCfg.GtidMode,
+	); err != nil {
 		log.Fatalf("Failed to run %q query: %+v", query, err)
 		return err
 	}
-	bf.logBinCfg = logBinCfg
+	return serverCfg, err
+}
+
+/*
+func (bf *BinlogFill) loadServerConfig() (serverCfg ServerConfig, err error) {
+	serverCfg, err := bf.readServerConfig()
+	if err != nil {
+		return serverCfg, err
+	}
+
+	if !serverCfg.LogBin {
+		return serverCfg, errLogBinDisabled
+	}
+*/
+
+func (bf *BinlogFill) resetReplication() (err error) {
+	queries := []string{
+		`STOP SLAVE`,
+		`RESET SLAVE`,
+		`RESET MASTER`,
+	}
+	for _, query := range queries {
+		if _, err = bf.db.Exec(query); err != nil {
+			log.Printf("Failed to run %q query: %+v", query, err)
+			return err
+		}
+	}
+	log.Println("Reset replication states")
 	return nil
 }
 
@@ -98,20 +162,36 @@ func main() {
 
 	bf := &BinlogFill{db: db}
 
-	err = bf.readLogBinConfig()
+	err = bf.readServerConfig()
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("readLogBinConfig: %+v", bf.logBinCfg)
+	log.Printf("readServerConfig: %+v", bf.serverCfg)
 
-	binaryLogs, err := bf.readBinaryLogs()
+	binaryLogs, err := bf.getBinaryLogs()
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("readBinaryLogs: %+v", binaryLogs)
+	log.Printf("getBinaryLogs: %+v", binaryLogs)
 
-	if err = bf.readGtidExecuted(); err != nil {
+	if bf.origGtidExecuted, err = bf.getGtidExecuted(); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("readGtidExecuted: %+v", bf.gtidExecuted)
+	if bf.origGtidExecuted == nil {
+		log.Println("readGtidExecuted: returned no gtid state, assuming host ran RESET SLAVE")
+	} else {
+		log.Printf("readGtidExecuted: %+v", bf.origGtidExecuted)
+	}
+
+	/*
+		if err = bf.resetReplication(); err != nil {
+			log.Fatal(err)
+		}
+	*/
+
+	gtidExecuted, err := bf.getGtidExecuted()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("final readGtidExecuted: %+v", gtidExecuted)
 }
